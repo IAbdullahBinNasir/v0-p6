@@ -1,42 +1,64 @@
+// middleware.ts
 import { type NextRequest, NextResponse } from "next/server"
 
-export function middleware(request: NextRequest) {
-  const response = NextResponse.next()
+export function middleware(_req: NextRequest) {
+  const res = NextResponse.next()
 
-  // Prevent clickjacking attacks
-  response.headers.set("X-Frame-Options", "DENY")
+  // Security headers common to both envs
+  res.headers.set("X-Frame-Options", "DENY")
+  res.headers.set("X-Content-Type-Options", "nosniff")
+  res.headers.set("Referrer-Policy", "strict-origin-when-cross-origin")
+  // (X-XSS-Protection is deprecated; modern browsers ignore it)
 
-  // Prevent MIME type sniffing
-  response.headers.set("X-Content-Type-Options", "nosniff")
-
-  // Enable XSS protection
-  response.headers.set("X-XSS-Protection", "1; mode=block")
-
-  // Referrer policy
-  response.headers.set("Referrer-Policy", "strict-origin-when-cross-origin")
-
-  // Permissions policy (formerly Feature-Policy)
-  response.headers.set(
+  res.headers.set(
     "Permissions-Policy",
     "geolocation=(), microphone=(), camera=(), payment=(), usb=(), magnetometer=(), gyroscope=(), accelerometer=()",
   )
 
-  response.headers.set(
-    "Content-Security-Policy",
-    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https:; frame-ancestors 'none'; base-uri 'self'; form-action 'self';",
-  )
+  if (process.env.NODE_ENV === "development") {
+    // ✅ Looser CSP for local dev (allows HMR, eval, inline styles, etc.)
+    const devCsp = [
+      "default-src 'self'",
+      // Next dev HMR uses eval + inline scripts
+      "script-src 'self' 'unsafe-eval' 'unsafe-inline' blob: data:",
+      // You use many inline style attributes in components
+      "style-src 'self' 'unsafe-inline'",
+      // HMR/websocket + any API you call locally
+      "connect-src * ws: wss:",
+      // Allow images/fonts from anywhere in dev
+      "img-src * data: blob:",
+      "font-src * data:",
+      "frame-ancestors 'none'",
+      "base-uri 'self'",
+      "form-action 'self'",
+    ].join("; ")
+    res.headers.set("Content-Security-Policy", devCsp)
+  } else {
+    // 🔒 Stricter CSP for production
+    // NOTE: Because your components use inline styles (style={{ ... }}),
+    // you must keep 'unsafe-inline' for style-src **OR** refactor to classes.
+    const prodCsp = [
+      "default-src 'self'",
+      // No inline/eval scripts in prod
+      "script-src 'self'",
+      // Keep 'unsafe-inline' because you use inline styles everywhere
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' https: data:",
+      "font-src 'self' data:",
+      // Include your API and any 3rd-party origins as needed
+      "connect-src 'self' https:",
+      "frame-ancestors 'none'",
+      "base-uri 'self'",
+      "form-action 'self'",
+    ].join("; ")
+    res.headers.set("Content-Security-Policy", prodCsp)
+  }
 
-  return response
+  return res
 }
 
 export const config = {
   matcher: [
-    /*
-     * Match all request paths except for the ones starting with:
-     * - _next/static (static files)
-     * - _next/image (image optimization files)
-     * - favicon.ico (favicon file)
-     */
     "/((?!_next/static|_next/image|favicon.ico).*)",
   ],
 }
