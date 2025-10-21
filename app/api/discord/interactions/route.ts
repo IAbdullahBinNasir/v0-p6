@@ -40,11 +40,18 @@ function verifySignature(req: NextRequest, rawBody: string) {
   )
 }
 
+function getBaseUrl(req: NextRequest) {
+  // Prefer env if valid (for Vercel), otherwise derive from request (works locally & in preview)
+  const envBase = config.backendUrl
+  if (envBase && /^https?:\/\//i.test(envBase)) return envBase.replace(/\/+$/, "")
+  const u = new URL(req.url)
+  return `${u.protocol}//${u.host}`
+}
+
 type AssignedProject = { id: number; name: string }
 
-async function getAssignedProjects(discordId: string): Promise<AssignedProject[]> {
-  if (!config.backendUrl) throw new Error("env for backend url not set")
-  const url = `${config.backendUrl}/api/discord/assigned-projects?discord_id=${encodeURIComponent(discordId)}`
+async function getAssignedProjects(discordId: string, base: string): Promise<AssignedProject[]> {
+  const url = `${base}/api/discord/assigned-projects?discord_id=${encodeURIComponent(discordId)}`
   const res = await fetch(url, { headers: { "Content-Type": "application/json" }, cache: "no-store" })
   if (!res.ok) throw new Error(`Failed to load assigned projects (${res.status})`)
   return (await res.json()) as AssignedProject[]
@@ -62,7 +69,7 @@ async function postJson(url: string, body: unknown, headers: Record<string, stri
       const j = await res.json()
       msg = j?.error || j?.message || msg
     } catch {
-      try { msg = await res.text() } catch { }
+      try { msg = await res.text() } catch {}
     }
     throw new Error(msg)
   }
@@ -81,11 +88,29 @@ async function patchJson(url: string, body: unknown, headers: Record<string, str
       const j = await res.json()
       msg = j?.error || j?.message || msg
     } catch {
-      try { msg = await res.text() } catch { }
+      try { msg = await res.text() } catch {}
     }
     throw new Error(msg)
   }
   try { return await res.json() } catch { return null }
+}
+
+async function completeActiveMilestone(base: string, projectId: string | undefined, userId: string) {
+  if (!config.serviceBotToken) throw new Error("Server misconfigured: SERVICE_BOT_TOKEN")
+  return patchJson(
+    `${base}/api/projects/${projectId}/milestones`,
+    { status: "completed", callerDiscordId: userId },
+    { Authorization: `Bearer ${config.serviceBotToken}` },
+  )
+}
+
+async function postProgress(base: string, projectId: string | undefined, title: string, description: string, userId: string) {
+  if (!config.serviceBotToken) throw new Error("Server misconfigured: SERVICE_BOT_TOKEN")
+  return postJson(
+    `${base}/api/projects/${projectId}/progress`,
+    { title, description, callerDiscordId: userId },
+    { Authorization: `Bearer ${config.serviceBotToken}` },
+  )
 }
 
 /** Use application_id from the interaction body if present */
@@ -181,6 +206,7 @@ export async function POST(req: NextRequest) {
   }
 
   const body = JSON.parse(raw)
+  const base = getBaseUrl(req)
 
   // 1) PING
   if (body?.type === InteractionType.PING) {
@@ -197,7 +223,7 @@ export async function POST(req: NextRequest) {
 
     if (name === "progress-update") {
       try {
-        const projects = await getAssignedProjects(userId)
+        const projects = await getAssignedProjects(userId, base)
         if (!projects.length) {
           return NextResponse.json({
             type: InteractionCallbackType.CHANNEL_MESSAGE_WITH_SOURCE,
@@ -223,7 +249,7 @@ export async function POST(req: NextRequest) {
 
     if (name === "milestone-status") {
       try {
-        const projects = await getAssignedProjects(userId)
+        const projects = await getAssignedProjects(userId, base)
         if (!projects.length) {
           return NextResponse.json({
             type: InteractionCallbackType.CHANNEL_MESSAGE_WITH_SOURCE,
@@ -314,29 +340,25 @@ export async function POST(req: NextRequest) {
         })
       }
 
-      // Do work NOW (no queueMicrotask), then return a deferred update ack
-      try {
-        if (!config.serviceBotToken || !config.backendUrl) throw new Error("Server misconfigured")
-        await patchJson(
-          `${config.backendUrl}/api/projects/${projectId}/milestones`,
-          { status: "completed", callerDiscordId: userId },
-          { Authorization: `Bearer ${config.serviceBotToken}` },
-        )
-
-        await sendFollowup(applicationId, interactionToken,
-          `🎯 **${projectName}** — active milestone **marked completed** by <@${userId}>`,
-          false
-        )
-        await sendFollowup(applicationId, interactionToken,
-          `Done. Active milestone marked **completed** for **${projectName}**.`,
-          true
-        )
-      } catch (err: any) {
-        await sendFollowup(applicationId, interactionToken,
-          `❌ Error updating milestone: ${err?.message || "unknown error"}`,
-          true
-        )
-      }
+      // ACK immediately, then do the work and send follow-ups
+      queueMicrotask(async () => {
+        try {
+          await completeActiveMilestone(base, projectId, userId)
+          await sendFollowup(body?.application_id, body?.token,
+            `🎯 **${projectName}** — active milestone **marked completed** by <@${userId}>`,
+            false
+          )
+          await sendFollowup(body?.application_id, body?.token,
+            `Done. Active milestone marked **completed** for **${projectName}**.`,
+            true
+          )
+        } catch (err: any) {
+          await sendFollowup(body?.application_id, body?.token,
+            `❌ Error updating milestone: ${err?.message || "unknown error"}`,
+            true
+          )
+        }
+      })
 
       return NextResponse.json({ type: InteractionCallbackType.DEFERRED_UPDATE_MESSAGE })
     }
@@ -365,34 +387,30 @@ export async function POST(req: NextRequest) {
       const title = fields["title_input"] || ""
       const description = fields["desc_input"] || ""
 
-      try {
-        if (!config.serviceBotToken || !config.backendUrl) throw new Error("Server misconfigured")
-        await postJson(
-          `${config.backendUrl}/api/projects/${projectId}/progress`,
-          { title, description, callerDiscordId: userId },
-          { Authorization: `Bearer ${config.serviceBotToken}` },
-        )
+      // ACK immediately, then do the work and follow-ups
+      queueMicrotask(async () => {
+        try {
+          await postProgress(base, projectId, title, description, userId)
+          await sendFollowup(body?.application_id, body?.token,
+            [
+              `📝 **${projectName}** — recent update from <@${userId}>`,
+              `**Title:** ${title}`,
+              description ? `**Description:** ${description}` : `**Description:** _none_`,
+            ].join("\n"),
+            false
+          )
+          await sendFollowup(body?.application_id, body?.token,
+            `✅ Posted a recent update to **${projectName}**.`,
+            true
+          )
+        } catch (err: any) {
+          await sendFollowup(body?.application_id, body?.token,
+            `❌ Error: ${err?.message || "failed to post update"}`,
+            true
+          )
+        }
+      })
 
-        await sendFollowup(applicationId, interactionToken,
-          [
-            `📝 **${projectName}** — recent update from <@${userId}>`,
-            `**Title:** ${title}`,
-            description ? `**Description:** ${description}` : `**Description:** _none_`,
-          ].join("\n"),
-          false
-        )
-        await sendFollowup(applicationId, interactionToken,
-          `✅ Posted a recent update to **${projectName}**.`,
-          true
-        )
-      } catch (err: any) {
-        await sendFollowup(applicationId, interactionToken,
-          `❌ Error: ${err?.message || "failed to post update"}`,
-          true
-        )
-      }
-
-      // deferred channel message ACK (we already followed up)
       return NextResponse.json({ type: InteractionCallbackType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE })
     }
 
