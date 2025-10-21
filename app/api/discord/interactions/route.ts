@@ -3,9 +3,10 @@ import { config } from "@/configs/config"
 import { NextResponse, type NextRequest } from "next/server"
 import nacl from "tweetnacl"
 
-// Vercel/Next serverless friendly
+// Serverless-friendly
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
+export const maxDuration = 10
 
 // ---- Discord constants ----
 const InteractionType = {
@@ -25,7 +26,6 @@ const InteractionCallbackType = {
   MODAL: 9,
 } as const
 
-// Ephemeral flag bit for responses
 const EPHEMERAL = 1 << 6
 
 // ---- Helpers ----
@@ -42,7 +42,6 @@ function verifySignature(req: NextRequest, rawBody: string) {
 
 type AssignedProject = { id: number; name: string }
 
-/** Call your backend for projects assigned to this Discord user */
 async function getAssignedProjects(discordId: string): Promise<AssignedProject[]> {
   if (!config.backendUrl) throw new Error("env for backend url not set")
   const url = `${config.backendUrl}/api/discord/assigned-projects?discord_id=${encodeURIComponent(discordId)}`
@@ -51,7 +50,6 @@ async function getAssignedProjects(discordId: string): Promise<AssignedProject[]
   return (await res.json()) as AssignedProject[]
 }
 
-/** Backend calls mirroring your commander helpers */
 async function postJson(url: string, body: unknown, headers: Record<string, string> = {}) {
   const res = await fetch(url, {
     method: "POST",
@@ -64,17 +62,11 @@ async function postJson(url: string, body: unknown, headers: Record<string, stri
       const j = await res.json()
       msg = j?.error || j?.message || msg
     } catch {
-      try {
-        msg = await res.text()
-      } catch {}
+      try { msg = await res.text() } catch { }
     }
     throw new Error(msg)
   }
-  try {
-    return await res.json()
-  } catch {
-    return null
-  }
+  try { return await res.json() } catch { return null }
 }
 
 async function patchJson(url: string, body: unknown, headers: Record<string, string> = {}) {
@@ -89,36 +81,26 @@ async function patchJson(url: string, body: unknown, headers: Record<string, str
       const j = await res.json()
       msg = j?.error || j?.message || msg
     } catch {
-      try {
-        msg = await res.text()
-      } catch {}
+      try { msg = await res.text() } catch { }
     }
     throw new Error(msg)
   }
-  try {
-    return await res.json()
-  } catch {
-    return null
-  }
+  try { return await res.json() } catch { return null }
 }
 
-/** Send a follow-up message via the interaction webhook (can be public if you omit EPHEMERAL) */
-async function sendFollowup(token: string, content: string, ephemeral = false) {
-  if (!config.discordAppId) throw new Error("env for DISCORD APPLICATION ID not set")
-  const url = `https://discord.com/api/v10/webhooks/${config.discordAppId}/${token}`
+/** Use application_id from the interaction body if present */
+async function sendFollowup(applicationId: string | undefined, token: string | undefined, content: string, ephemeral = false) {
+  const appId = applicationId || config.discordAppId
+  if (!appId || !token) return
+  const url = `https://discord.com/api/v10/webhooks/${appId}/${token}`
   await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      content,
-      flags: ephemeral ? EPHEMERAL : undefined,
-    }),
+    body: JSON.stringify({ content, flags: ephemeral ? EPHEMERAL : undefined }),
   })
 }
 
-/** Utilities to build Discord component payloads */
 function optionValue(id: number, name: string) {
-  // encode label into value so we can read it on the server later
   return `${id}::${encodeURIComponent(name)}`
 }
 function parseOptionValue(v: string | undefined): { id: string | null; name: string } {
@@ -127,25 +109,20 @@ function parseOptionValue(v: string | undefined): { id: string | null; name: str
   return { id: id || null, name: enc ? decodeURIComponent(enc) : "Project" }
 }
 
-// Build a SELECT of projects (max 25) — ephemeral
 function buildProjectSelect(customId: string, projects: AssignedProject[], placeholder: string) {
   return {
-    type: 1, // ActionRow
+    type: 1,
     components: [
       {
-        type: 3, // StringSelect
+        type: 3,
         custom_id: customId,
         placeholder,
-        options: projects.slice(0, 25).map((p) => ({
-          label: p.name,
-          value: optionValue(p.id, p.name),
-        })),
+        options: projects.slice(0, 25).map((p) => ({ label: p.name, value: optionValue(p.id, p.name) })),
       },
     ],
   }
 }
 
-// Build the single-option status select for "completed"
 function buildStatusSelect(customId: string) {
   return {
     type: 1,
@@ -160,7 +137,6 @@ function buildStatusSelect(customId: string) {
   }
 }
 
-// Build the modal for progress update
 function buildProgressModal(projectId: string, projectName: string) {
   return {
     title: "Post a recent update",
@@ -170,10 +146,10 @@ function buildProgressModal(projectId: string, projectName: string) {
         type: 1,
         components: [
           {
-            type: 4, // Text input
+            type: 4,
             custom_id: "title_input",
             label: "Title",
-            style: 1, // Short
+            style: 1,
             min_length: 3,
             max_length: 120,
             required: true,
@@ -187,7 +163,7 @@ function buildProgressModal(projectId: string, projectName: string) {
             type: 4,
             custom_id: "desc_input",
             label: "Description (optional)",
-            style: 2, // Paragraph
+            style: 2,
             required: false,
             max_length: 2000,
           },
@@ -211,8 +187,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ type: InteractionCallbackType.PONG })
   }
 
-  const userId: string =
-    body?.member?.user?.id || body?.user?.id || "" // handles guild + DMs
+  const userId: string = body?.member?.user?.id || body?.user?.id || ""
+  const interactionToken: string | undefined = body?.token
+  const applicationId: string | undefined = body?.application_id
 
   // 2) APPLICATION COMMANDS
   if (body?.type === InteractionType.APPLICATION_COMMAND) {
@@ -224,10 +201,7 @@ export async function POST(req: NextRequest) {
         if (!projects.length) {
           return NextResponse.json({
             type: InteractionCallbackType.CHANNEL_MESSAGE_WITH_SOURCE,
-            data: {
-              content: "No projects are assigned to you yet.",
-              flags: EPHEMERAL,
-            },
+            data: { content: "No projects are assigned to you yet.", flags: EPHEMERAL },
           })
         }
 
@@ -253,10 +227,7 @@ export async function POST(req: NextRequest) {
         if (!projects.length) {
           return NextResponse.json({
             type: InteractionCallbackType.CHANNEL_MESSAGE_WITH_SOURCE,
-            data: {
-              content: "No projects are assigned to you yet.",
-              flags: EPHEMERAL,
-            },
+            data: { content: "No projects are assigned to you yet.", flags: EPHEMERAL },
           })
         }
 
@@ -282,7 +253,7 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  // 3) MESSAGE COMPONENTS (selects)
+  // 3) MESSAGE COMPONENTS
   if (body?.type === InteractionType.MESSAGE_COMPONENT) {
     const customId = body?.data?.custom_id as string
     const values: string[] = body?.data?.values || []
@@ -296,7 +267,6 @@ export async function POST(req: NextRequest) {
           data: { content: "❌ No project selected.", flags: EPHEMERAL },
         })
       }
-      // Return a modal
       return NextResponse.json({
         type: InteractionCallbackType.MODAL,
         data: buildProgressModal(picked.id, picked.name),
@@ -331,7 +301,6 @@ export async function POST(req: NextRequest) {
       const projectName = decodeURIComponent(parts[2] || "Project")
       const choice = (body?.data?.values?.[0] as string) || ""
 
-      // If not "completed", just inform
       if (choice !== "completed") {
         return NextResponse.json({
           type: InteractionCallbackType.UPDATE_MESSAGE,
@@ -345,32 +314,33 @@ export async function POST(req: NextRequest) {
         })
       }
 
-      // Acknowledge immediately (defer update), then do the PATCH and follow-up
-      queueMicrotask(async () => {
-        try {
-          if (!config.serviceBotToken || !config.backendUrl) throw new Error("Server misconfigured")
-          await patchJson(
-            `${config.backendUrl}/api/projects/${projectId}/milestones`,
-            { status: "completed", callerDiscordId: userId },
-            { Authorization: `Bearer ${config.serviceBotToken}` },
-          )
-          // Public confirmation in the channel:
-          await sendFollowup(
-            body.token,
-            `🎯 **${projectName}** — active milestone **marked completed** by <@${userId}>`,
-            false,
-          )
-          // Ephemeral ack to user
-          await sendFollowup(body.token, `Done. Active milestone marked **completed** for **${projectName}**.`, true)
-        } catch (err: any) {
-          await sendFollowup(body.token, `❌ Error updating milestone: ${err?.message || "unknown error"}`, true)
-        }
-      })
+      // Do work NOW (no queueMicrotask), then return a deferred update ack
+      try {
+        if (!config.serviceBotToken || !config.backendUrl) throw new Error("Server misconfigured")
+        await patchJson(
+          `${config.backendUrl}/api/projects/${projectId}/milestones`,
+          { status: "completed", callerDiscordId: userId },
+          { Authorization: `Bearer ${config.serviceBotToken}` },
+        )
+
+        await sendFollowup(applicationId, interactionToken,
+          `🎯 **${projectName}** — active milestone **marked completed** by <@${userId}>`,
+          false
+        )
+        await sendFollowup(applicationId, interactionToken,
+          `Done. Active milestone marked **completed** for **${projectName}**.`,
+          true
+        )
+      } catch (err: any) {
+        await sendFollowup(applicationId, interactionToken,
+          `❌ Error updating milestone: ${err?.message || "unknown error"}`,
+          true
+        )
+      }
 
       return NextResponse.json({ type: InteractionCallbackType.DEFERRED_UPDATE_MESSAGE })
     }
 
-    // Unknown component
     return NextResponse.json({
       type: InteractionCallbackType.CHANNEL_MESSAGE_WITH_SOURCE,
       data: { content: "Unknown action.", flags: EPHEMERAL },
@@ -385,8 +355,6 @@ export async function POST(req: NextRequest) {
       const projectId = parts[1]
       const projectName = decodeURIComponent(parts[2] || "Project")
 
-      // Extract fields from modal
-      // body.data.components is ActionRow[] -> each row has components[0] with { custom_id, value }
       const fields: Record<string, string> = {}
       for (const row of body.data.components || []) {
         const comp = row?.components?.[0]
@@ -397,35 +365,34 @@ export async function POST(req: NextRequest) {
       const title = fields["title_input"] || ""
       const description = fields["desc_input"] || ""
 
-      // Defer + do work + follow-up
-      queueMicrotask(async () => {
-        try {
-          if (!config.serviceBotToken || !config.backendUrl) throw new Error("Server misconfigured")
-          await postJson(
-            `${config.backendUrl}/api/projects/${projectId}/progress`,
-            { title, description, callerDiscordId: userId },
-            { Authorization: `Bearer ${config.serviceBotToken}` },
-          )
+      try {
+        if (!config.serviceBotToken || !config.backendUrl) throw new Error("Server misconfigured")
+        await postJson(
+          `${config.backendUrl}/api/projects/${projectId}/progress`,
+          { title, description, callerDiscordId: userId },
+          { Authorization: `Bearer ${config.serviceBotToken}` },
+        )
 
-          // Public channel note
-          await sendFollowup(
-            body.token,
-            [
-              `📝 **${projectName}** — recent update from <@${userId}>`,
-              `**Title:** ${title}`,
-              description ? `**Description:** ${description}` : `**Description:** _none_`,
-            ].join("\n"),
-            false,
-          )
+        await sendFollowup(applicationId, interactionToken,
+          [
+            `📝 **${projectName}** — recent update from <@${userId}>`,
+            `**Title:** ${title}`,
+            description ? `**Description:** ${description}` : `**Description:** _none_`,
+          ].join("\n"),
+          false
+        )
+        await sendFollowup(applicationId, interactionToken,
+          `✅ Posted a recent update to **${projectName}**.`,
+          true
+        )
+      } catch (err: any) {
+        await sendFollowup(applicationId, interactionToken,
+          `❌ Error: ${err?.message || "failed to post update"}`,
+          true
+        )
+      }
 
-          // Ephemeral ack
-          await sendFollowup(body.token, `✅ Posted a recent update to **${projectName}**.`, true)
-        } catch (err: any) {
-          await sendFollowup(body.token, `❌ Error: ${err?.message || "failed to post update"}`, true)
-        }
-      })
-
-      // Discord wants an immediate ACK
+      // deferred channel message ACK (we already followed up)
       return NextResponse.json({ type: InteractionCallbackType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE })
     }
 
@@ -435,7 +402,6 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  // Fallback
   return NextResponse.json({
     type: InteractionCallbackType.CHANNEL_MESSAGE_WITH_SOURCE,
     data: { content: "Unsupported interaction.", flags: EPHEMERAL },
