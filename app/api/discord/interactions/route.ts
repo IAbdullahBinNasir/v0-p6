@@ -1,16 +1,11 @@
 // app/api/discord/interactions/route.ts
+import { config } from "@/configs/config"
 import { NextResponse, type NextRequest } from "next/server"
 import nacl from "tweetnacl"
 
 // Vercel/Next serverless friendly
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
-
-// ---- ENV ----
-const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY || ""
-const DISCORD_APPLICATION_ID = process.env.DISCORD_APPLICATION_ID || ""
-const SERVICE_BOT_TOKEN = process.env.SERVICE_BOT_TOKEN || ""
-const BACKEND_URL = process.env.BACKEND_URL || ""
 
 // ---- Discord constants ----
 const InteractionType = {
@@ -37,11 +32,11 @@ const EPHEMERAL = 1 << 6
 function verifySignature(req: NextRequest, rawBody: string) {
     const sig = req.headers.get("x-signature-ed25519") || ""
     const ts = req.headers.get("x-signature-timestamp") || ""
-    if (!sig || !ts || !DISCORD_PUBLIC_KEY) return false
+    if (!sig || !ts || !config.discordPublicKey) return false
     return nacl.sign.detached.verify(
         Buffer.from(ts + rawBody),
         Buffer.from(sig, "hex"),
-        Buffer.from(DISCORD_PUBLIC_KEY, "hex"),
+        Buffer.from(config.discordPublicKey, "hex"),
     )
 }
 
@@ -49,8 +44,8 @@ type AssignedProject = { id: number; name: string }
 
 /** Call your backend for projects assigned to this Discord user */
 async function getAssignedProjects(discordId: string): Promise<AssignedProject[]> {
-    if (!BACKEND_URL) throw new Error("BACKEND_URL not set")
-    const url = `${BACKEND_URL}/api/discord/assigned-projects?discord_id=${encodeURIComponent(discordId)}`
+    if (!config.backendUrl) throw new Error("BACKEND_URL not set")
+    const url = `${config.backendUrl}/api/discord/assigned-projects?discord_id=${encodeURIComponent(discordId)}`
     const res = await fetch(url, { headers: { "Content-Type": "application/json" }, cache: "no-store" })
     if (!res.ok) throw new Error(`Failed to load assigned projects (${res.status})`)
     return (await res.json()) as AssignedProject[]
@@ -109,8 +104,8 @@ async function patchJson(url: string, body: unknown, headers: Record<string, str
 
 /** Send a follow-up message via the interaction webhook (can be public if you omit EPHEMERAL) */
 async function sendFollowup(token: string, content: string, ephemeral = false) {
-    if (!DISCORD_APPLICATION_ID) throw new Error("DISCORD_APPLICATION_ID not set")
-    const url = `https://discord.com/api/v10/webhooks/${DISCORD_APPLICATION_ID}/${token}`
+    if (!config.discordAppId) throw new Error("DISCORD_APPLICATION_ID not set")
+    const url = `https://discord.com/api/v10/webhooks/${config.discordAppId}/${token}`
     await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -353,11 +348,11 @@ export async function POST(req: NextRequest) {
             // Acknowledge immediately (defer update), then do the PATCH and follow-up
             queueMicrotask(async () => {
                 try {
-                    if (!SERVICE_BOT_TOKEN || !BACKEND_URL) throw new Error("Server misconfigured")
+                    if (!config.serviceBotToken || !config.backendUrl) throw new Error("Server misconfigured")
                     await patchJson(
-                        `${BACKEND_URL}/api/projects/${projectId}/milestones`,
+                        `${config.backendUrl}/api/projects/${projectId}/milestones`,
                         { status: "completed", callerDiscordId: userId },
-                        { Authorization: `Bearer ${SERVICE_BOT_TOKEN}` },
+                        { Authorization: `Bearer ${config.serviceBotToken}` },
                     )
                     // Public confirmation in the channel:
                     await sendFollowup(
@@ -405,11 +400,11 @@ export async function POST(req: NextRequest) {
             // Defer + do work + follow-up
             queueMicrotask(async () => {
                 try {
-                    if (!SERVICE_BOT_TOKEN || !BACKEND_URL) throw new Error("Server misconfigured")
+                    if (!config.serviceBotToken || !config.backendUrl) throw new Error("Server misconfigured")
                     await postJson(
-                        `${BACKEND_URL}/api/projects/${projectId}/progress`,
+                        `${config.backendUrl}/api/projects/${projectId}/progress`,
                         { title, description, callerDiscordId: userId },
-                        { Authorization: `Bearer ${SERVICE_BOT_TOKEN}` },
+                        { Authorization: `Bearer ${config.serviceBotToken}` },
                     )
 
                     // Public channel note
