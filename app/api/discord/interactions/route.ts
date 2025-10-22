@@ -40,7 +40,7 @@ function verifySignature(req: NextRequest, rawBody: string) {
 function getBaseUrl(req: NextRequest) {
   try {
     if (config.backendUrl && /^https?:\/\//i.test(config.backendUrl)) return config.backendUrl.replace(/\/+$/, "")
-  } catch { }
+  } catch {}
   const u = new URL(req.url)
   return `${u.protocol}//${u.host}`
 }
@@ -78,7 +78,7 @@ async function postJson(base: string, path: string, body: unknown, headers: Reco
       const j = await res.json()
       msg = j?.error || j?.message || msg
     } catch {
-      try { msg = await res.text() } catch { }
+      try { msg = await res.text() } catch {}
     }
     throw new Error(msg)
   }
@@ -98,11 +98,32 @@ async function patchJson(base: string, path: string, body: unknown, headers: Rec
       const j = await res.json()
       msg = j?.error || j?.message || msg
     } catch {
-      try { msg = await res.text() } catch { }
+      try { msg = await res.text() } catch {}
     }
     throw new Error(msg)
   }
   try { return await res.json() } catch { return null }
+}
+
+/** Post a normal (persistent) message in the channel using the bot token */
+async function postChannelMessage(channelId: string, content: string) {
+  if (!config.discordBotToken) {
+    console.warn("[interactions] No DISCORD_BOT_TOKEN_COMMANDER set; cannot post persistent channel messages.")
+    return
+  }
+  const url = `https://discord.com/api/v10/channels/${channelId}/messages`
+  const res = await trace("channel-message", url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bot ${config.discordBotToken}`,
+    },
+    body: JSON.stringify({ content }),
+  })
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "")
+    console.error("[interactions] failed to post channel message:", res.status, txt)
+  }
 }
 
 function optionValue(id: number, name: string) {
@@ -164,6 +185,7 @@ export async function POST(req: NextRequest) {
     hasServiceBotToken: !!config.serviceBotToken,
     hasAppId: !!config.discordAppId,
     hasPublicKey: !!config.discordPublicKey,
+    hasBotToken: !!config.discordBotToken,
   })
 
   // 1) PING
@@ -172,6 +194,7 @@ export async function POST(req: NextRequest) {
   }
 
   const userId: string = body?.member?.user?.id || body?.user?.id || ""
+  const channelId: string = body?.channel_id
 
   // 2) Slash commands
   if (body?.type === InteractionType.APPLICATION_COMMAND) {
@@ -271,7 +294,7 @@ export async function POST(req: NextRequest) {
       })
     }
 
-    // Status chosen → DO WORK NOW, then return final message (no followups)
+    // Status chosen → DO WORK NOW + post public message
     if (customId.startsWith("set_status:")) {
       const parts = customId.split(":")
       const projectId = parts[1]
@@ -295,10 +318,19 @@ export async function POST(req: NextRequest) {
         if (!config.serviceBotToken) throw new Error("Server misconfigured: SERVICE_BOT_TOKEN")
         await patchJson(base, `/api/projects/${projectId}/milestones`, { status: "completed", callerDiscordId: userId }, { Authorization: `Bearer ${config.serviceBotToken}` })
 
+        // Post persistent channel message (non-ephemeral)
+        if (channelId) {
+          await postChannelMessage(
+            channelId,
+            `🎯 **${projectName}** — active milestone **marked completed** by <@${userId}>`,
+          )
+        }
+
+        // Ephemeral clean-up/ack
         return NextResponse.json({
           type: InteractionCallbackType.UPDATE_MESSAGE,
           data: {
-            content: `🎯 **${projectName}** — active milestone **marked completed** by <@${userId}>`,
+            content: `Done. Active milestone marked **completed** for **${projectName}**.`,
             components: [],
             flags: EPHEMERAL,
           },
@@ -322,7 +354,7 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  // 4) Modal submit → DO WORK NOW, then return final message (no followups)
+  // 4) Modal submit → DO WORK NOW + post public message
   if (body?.type === InteractionType.MODAL_SUBMIT) {
     const customId = body?.data?.custom_id as string
     if (customId.startsWith("progress_modal:")) {
@@ -342,17 +374,22 @@ export async function POST(req: NextRequest) {
         if (!config.serviceBotToken) throw new Error("Server misconfigured: SERVICE_BOT_TOKEN")
         await postJson(base, `/api/projects/${projectId}/progress`, { title, description, callerDiscordId: userId }, { Authorization: `Bearer ${config.serviceBotToken}` })
 
+        // Post persistent channel message
+        if (channelId) {
+          await postChannelMessage(
+            channelId,
+            [
+              `📝 **${projectName}** — recent update from <@${userId}>`,
+              `**Title:** ${title}`,
+              description ? `**Description:** ${description}` : `**Description:** _none_`,
+            ].join("\n"),
+          )
+        }
+
+        // Ephemeral ack to the user
         return NextResponse.json({
           type: InteractionCallbackType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: {
-            content:
-              [
-                `📝 **${projectName}** — recent update from <@${userId}>`,
-                `**Title:** ${title}`,
-                description ? `**Description:** ${description}` : `**Description:** _none_`,
-              ].join("\n"),
-            flags: EPHEMERAL,
-          },
+          data: { content: "✅ Update posted.", flags: EPHEMERAL },
         })
       } catch (err: any) {
         console.error("[interactions][progress_modal] error:", err?.message || err)
