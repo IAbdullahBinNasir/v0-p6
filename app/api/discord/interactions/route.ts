@@ -27,8 +27,6 @@ const InteractionCallbackType = {
 } as const
 
 const EPHEMERAL = 1 << 6
-
-// Toggle noisy error echoing to Discord (still ephemeral):
 const DEBUG_TO_DISCORD = (process.env.DEBUG_INTERACTIONS || "").toLowerCase() === "true"
 
 // ---- Helpers ----
@@ -46,90 +44,66 @@ function verifySignature(req: NextRequest, rawBody: string) {
 function getBaseUrl(req: NextRequest) {
   try {
     if (config.backendUrl && /^https?:\/\//i.test(config.backendUrl)) return config.backendUrl.replace(/\/+$/, "")
-  } catch { }
+  } catch {}
   const u = new URL(req.url)
   return `${u.protocol}//${u.host}`
 }
 
-/**
- * A traced fetch wrapper:
- * - logs URL, method, headers (safe), and body length before request
- * - logs status + response text (up to a limit) on non-OK
- * - throws a rich Error with status + snippet for upper layers
- */
+/** traced fetch (logs URL/method, redacts auth, logs error bodies) */
 async function fetchWithTrace(
   label: string,
   url: string,
   init: RequestInit = {},
-  { echoBody = false }: { echoBody?: boolean } = {},
 ) {
   const startedAt = Date.now()
   const method = (init.method || "GET").toUpperCase()
-  const headers = Object.fromEntries(Object.entries((init.headers || {}) as Record<string, string>).map(([k, v]) => {
-    if (/authorization/i.test(k)) return [k, "****"]
-    return [k, v]
-  }))
+  const headers = Object.fromEntries(
+    Object.entries((init.headers || {}) as Record<string, string>).map(([k, v]) =>
+      [/authorization/i.test(k) ? [k, "****"] : [k, v]]
+    )
+  )
   let bodyLen = 0
-  try {
-    if (init.body && typeof init.body === "string") bodyLen = init.body.length
-  } catch { }
+  if (typeof init.body === "string") bodyLen = init.body.length
 
   console.log(`[interactions][${label}] → ${method} ${url} headers=${JSON.stringify(headers)} bodyLen=${bodyLen}`)
-
   const res = await fetch(url, init)
-
   const dur = Date.now() - startedAt
+
   if (!res.ok) {
     const text = await res.text().catch(() => "")
-    const snippet = text.slice(0, 500) // cap logs
+    const snippet = text.slice(0, 500)
     console.error(
       `[interactions][${label}] ← ${res.status} ${res.statusText} (${dur}ms)\n` +
-      `URL: ${url}\n` +
-      `Response: ${snippet || "<no body>"}`
+      `URL: ${url}\nResponse: ${snippet || "<no body>"}`
     )
     const err = new Error(`Fetch failed (${label}) ${res.status} ${res.statusText}: ${snippet || "<no body>"}`)
-      ; (err as any).status = res.status
-      ; (err as any).url = url
+    ;(err as any).status = res.status
+    ;(err as any).url = url
     throw err
   }
 
-  // Try to parse JSON, otherwise return text/null
   const ct = res.headers.get("content-type") || ""
   let data: any = null
-  if (ct.includes("application/json")) {
-    data = await res.json().catch(() => null)
-  } else {
-    data = await res.text().catch(() => null)
-  }
+  if (ct.includes("application/json")) data = await res.json().catch(() => null)
+  else data = await res.text().catch(() => null)
 
   console.log(`[interactions][${label}] ← ${res.status} OK (${dur}ms)`)
-  if (echoBody && data) {
-    console.log(`[interactions][${label}] body:`, typeof data === "string" ? data.slice(0, 500) : data)
-  }
-
   return data
 }
 
-async function sendFollowup(applicationId: string | undefined, token: string | undefined, content: string, ephemeral = false) {
+/** PATCH the original interaction message (safe for component + modal flows) */
+async function editOriginal(applicationId: string | undefined, token: string | undefined, payload: any) {
   const appId = applicationId || config.discordAppId
   if (!appId || !token) {
-    console.warn("[interactions][followup] missing appId or token; skipping")
+    console.warn("[interactions][editOriginal] missing appId or token; skip")
     return
   }
-  const url = `https://discord.com/api/v10/webhooks/${appId}/${token}`
-  try {
-    await fetchWithTrace(
-      "followup",
-      url,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content, flags: ephemeral ? EPHEMERAL : undefined }),
-      },
-    )
-  } catch (err: any) {
-    console.error("[interactions][followup] failed:", err?.message || err)
-  }
+  const url = `https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`
+  await fetchWithTrace("edit-original", url, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
 }
 
 type AssignedProject = { id: number; name: string }
@@ -155,7 +129,6 @@ function buildProjectSelect(customId: string, projects: AssignedProject[], place
     ],
   }
 }
-
 function buildStatusSelect(customId: string) {
   return {
     type: 1,
@@ -169,39 +142,13 @@ function buildStatusSelect(customId: string) {
     ],
   }
 }
-
 function buildProgressModal(projectId: string, projectName: string) {
   return {
     title: "Post a recent update",
     custom_id: `progress_modal:${projectId}:${encodeURIComponent(projectName)}`,
     components: [
-      {
-        type: 1,
-        components: [
-          {
-            type: 4,
-            custom_id: "title_input",
-            label: "Title",
-            style: 1,
-            min_length: 3,
-            max_length: 120,
-            required: true,
-          },
-        ],
-      },
-      {
-        type: 1,
-        components: [
-          {
-            type: 4,
-            custom_id: "desc_input",
-            label: "Description (optional)",
-            style: 2,
-            required: false,
-            max_length: 2000,
-          },
-        ],
-      },
+      { type: 1, components: [{ type: 4, custom_id: "title_input", label: "Title", style: 1, min_length: 3, max_length: 120, required: true }] },
+      { type: 1, components: [{ type: 4, custom_id: "desc_input", label: "Description (optional)", style: 2, required: false, max_length: 2000 }] },
     ],
   }
 }
@@ -212,7 +159,7 @@ async function getAssignedProjects(discordId: string, base: string): Promise<Ass
     headers: { "Content-Type": "application/json" },
     cache: "no-store",
   })
-  return Array.isArray(data) ? data as AssignedProject[] : []
+  return Array.isArray(data) ? (data as AssignedProject[]) : []
 }
 
 async function completeActiveMilestone(base: string, projectId: string | undefined, userId: string) {
@@ -251,7 +198,6 @@ export async function POST(req: NextRequest) {
   const body = JSON.parse(raw)
   const base = getBaseUrl(req)
 
-  // Log a quick env snapshot (safe)
   console.log("[interactions] base:", base, "env:", {
     hasBackendUrl: !!config.backendUrl,
     hasServiceBotToken: !!config.serviceBotToken,
@@ -265,8 +211,8 @@ export async function POST(req: NextRequest) {
   }
 
   const userId: string = body?.member?.user?.id || body?.user?.id || ""
-  const interactionToken: string | undefined = body?.token
   const applicationId: string | undefined = body?.application_id
+  const token: string | undefined = body?.token
 
   // 2) APPLICATION COMMANDS
   if (body?.type === InteractionType.APPLICATION_COMMAND) {
@@ -281,7 +227,6 @@ export async function POST(req: NextRequest) {
             data: { content: "No projects are assigned to you yet.", flags: EPHEMERAL },
           })
         }
-
         return NextResponse.json({
           type: InteractionCallbackType.CHANNEL_MESSAGE_WITH_SOURCE,
           data: {
@@ -292,7 +237,7 @@ export async function POST(req: NextRequest) {
         })
       } catch (err: any) {
         console.error("[interactions][progress-update] error:", err?.message || err)
-        const msg = DEBUG_TO_DISCORD ? `❌ Error: ${err?.message || "failed to load projects"}` : "❌ Error loading projects"
+        const msg = DEBUG_TO_DISCORD ? `❌ ${err?.message || "failed to load projects"}` : "❌ Error loading projects"
         return NextResponse.json({
           type: InteractionCallbackType.CHANNEL_MESSAGE_WITH_SOURCE,
           data: { content: msg, flags: EPHEMERAL },
@@ -309,7 +254,6 @@ export async function POST(req: NextRequest) {
             data: { content: "No projects are assigned to you yet.", flags: EPHEMERAL },
           })
         }
-
         return NextResponse.json({
           type: InteractionCallbackType.CHANNEL_MESSAGE_WITH_SOURCE,
           data: {
@@ -320,7 +264,7 @@ export async function POST(req: NextRequest) {
         })
       } catch (err: any) {
         console.error("[interactions][milestone-status] error:", err?.message || err)
-        const msg = DEBUG_TO_DISCORD ? `❌ Error: ${err?.message || "failed to load projects"}` : "❌ Error loading projects"
+        const msg = DEBUG_TO_DISCORD ? `❌ ${err?.message || "failed to load projects"}` : "❌ Error loading projects"
         return NextResponse.json({
           type: InteractionCallbackType.CHANNEL_MESSAGE_WITH_SOURCE,
           data: { content: msg, flags: EPHEMERAL },
@@ -375,48 +319,44 @@ export async function POST(req: NextRequest) {
       })
     }
 
-    // Status chosen
+    // Status chosen -> do work, then EDIT ORIGINAL (no followups)
     if (customId.startsWith("set_status:")) {
       const parts = customId.split(":")
       const projectId = parts[1]
       const projectName = decodeURIComponent(parts[2] || "Project")
       const choice = (body?.data?.values?.[0] as string) || ""
 
-      if (choice !== "completed") {
-        return NextResponse.json({
-          type: InteractionCallbackType.UPDATE_MESSAGE,
-          data: {
-            content:
-              `You picked \`${choice}\`. Via Discord you can only mark the active milestone as \`completed\`. ` +
-              `No changes were made.`,
+      // ACK immediately with "deferred update"
+      const ack = NextResponse.json({ type: InteractionCallbackType.DEFERRED_UPDATE_MESSAGE })
+
+      // Do the work in the background (token valid to edit original)
+      ;(async () => {
+        try {
+          if (choice !== "completed") {
+            await editOriginal(applicationId, token, {
+              content:
+                `You picked \`${choice}\`. Via Discord you can only mark the active milestone as \`completed\`. ` +
+                `No changes were made.`,
+              components: [],
+              flags: EPHEMERAL,
+            })
+            return
+          }
+
+          await completeActiveMilestone(base, projectId, userId)
+          await editOriginal(applicationId, token, {
+            content: `🎯 **${projectName}** — active milestone **marked completed** by <@${userId}>`,
             components: [],
             flags: EPHEMERAL,
-          },
-        })
-      }
+          })
+        } catch (err: any) {
+          console.error("[interactions][set_status] error:", err?.message || err)
+          const msg = DEBUG_TO_DISCORD ? `❌ ${err?.message || "Failed to update milestone"}` : "❌ Failed to update milestone"
+          await editOriginal(applicationId, token, { content: msg, components: [], flags: EPHEMERAL }).catch(() => {})
+        }
+      })()
 
-      // Do work NOW, then return a deferred update ack
-      try {
-        await completeActiveMilestone(base, projectId, userId)
-        await sendFollowup(
-          body?.application_id,
-          body?.token,
-          `🎯 **${projectName}** — active milestone **marked completed** by <@${userId}>`,
-          false
-        )
-        await sendFollowup(
-          body?.application_id,
-          body?.token,
-          `Done. Active milestone marked **completed** for **${projectName}**.`,
-          true
-        )
-      } catch (err: any) {
-        console.error("[interactions][set_status] error:", err?.message || err)
-        const msg = DEBUG_TO_DISCORD ? `❌ Error updating milestone: ${err?.message || "unknown error"}` : "❌ Failed to update milestone"
-        await sendFollowup(body?.application_id, body?.token, msg, true)
-      }
-
-      return NextResponse.json({ type: InteractionCallbackType.DEFERRED_UPDATE_MESSAGE })
+      return ack
     }
 
     return NextResponse.json({
@@ -433,6 +373,7 @@ export async function POST(req: NextRequest) {
       const projectId = parts[1]
       const projectName = decodeURIComponent(parts[2] || "Project")
 
+      // Extract fields
       const fields: Record<string, string> = {}
       for (const row of body.data.components || []) {
         const comp = row?.components?.[0]
@@ -443,27 +384,29 @@ export async function POST(req: NextRequest) {
       const title = fields["title_input"] || ""
       const description = fields["desc_input"] || ""
 
-      try {
-        await postProgress(base, projectId, title, description, userId)
+      // ACK immediately with "deferred channel msg"
+      const ack = NextResponse.json({ type: InteractionCallbackType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE })
 
-        await sendFollowup(
-          body?.application_id,
-          body?.token,
-          [
-            `📝 **${projectName}** — recent update from <@${userId}>`,
-            `**Title:** ${title}`,
-            description ? `**Description:** ${description}` : `**Description:** _none_`,
-          ].join("\n"),
-          false
-        )
-        await sendFollowup(body?.application_id, body?.token, `✅ Posted a recent update to **${projectName}**.`, true)
-      } catch (err: any) {
-        console.error("[interactions][progress_modal] error:", err?.message || err)
-        const msg = DEBUG_TO_DISCORD ? `❌ Error: ${err?.message || "failed to post update"}` : "❌ Failed to post update"
-        await sendFollowup(body?.application_id, body?.token, msg, true)
-      }
+      // Do work, then EDIT ORIGINAL with final content
+      ;(async () => {
+        try {
+          await postProgress(base, projectId, title, description, userId)
+          await editOriginal(applicationId, token, {
+            content: [
+              `📝 **${projectName}** — recent update from <@${userId}>`,
+              `**Title:** ${title}`,
+              description ? `**Description:** ${description}` : `**Description:** _none_`,
+            ].join("\n"),
+            flags: 0, // public
+          })
+        } catch (err: any) {
+          console.error("[interactions][progress_modal] error:", err?.message || err)
+          const msg = DEBUG_TO_DISCORD ? `❌ ${err?.message || "Failed to post update"}` : "❌ Failed to post update"
+          await editOriginal(applicationId, token, { content: msg, flags: EPHEMERAL }).catch(() => {})
+        }
+      })()
 
-      return NextResponse.json({ type: InteractionCallbackType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE })
+      return ack
     }
 
     return NextResponse.json({
