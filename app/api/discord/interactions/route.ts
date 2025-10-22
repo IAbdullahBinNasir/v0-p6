@@ -28,6 +28,9 @@ const InteractionCallbackType = {
 
 const EPHEMERAL = 1 << 6
 
+// Toggle noisy error echoing to Discord (still ephemeral):
+const DEBUG_TO_DISCORD = (process.env.DEBUG_INTERACTIONS || "").toLowerCase() === "true"
+
 // ---- Helpers ----
 function verifySignature(req: NextRequest, rawBody: string) {
   const sig = req.headers.get("x-signature-ed25519") || ""
@@ -41,90 +44,95 @@ function verifySignature(req: NextRequest, rawBody: string) {
 }
 
 function getBaseUrl(req: NextRequest) {
-  // Prefer env if valid (for Vercel), otherwise derive from request (works locally & in preview)
-  const envBase = config.backendUrl
-  if (envBase && /^https?:\/\//i.test(envBase)) return envBase.replace(/\/+$/, "")
+  try {
+    if (config.backendUrl && /^https?:\/\//i.test(config.backendUrl)) return config.backendUrl.replace(/\/+$/, "")
+  } catch { }
   const u = new URL(req.url)
   return `${u.protocol}//${u.host}`
 }
 
-type AssignedProject = { id: number; name: string }
+/**
+ * A traced fetch wrapper:
+ * - logs URL, method, headers (safe), and body length before request
+ * - logs status + response text (up to a limit) on non-OK
+ * - throws a rich Error with status + snippet for upper layers
+ */
+async function fetchWithTrace(
+  label: string,
+  url: string,
+  init: RequestInit = {},
+  { echoBody = false }: { echoBody?: boolean } = {},
+) {
+  const startedAt = Date.now()
+  const method = (init.method || "GET").toUpperCase()
+  const headers = Object.fromEntries(Object.entries((init.headers || {}) as Record<string, string>).map(([k, v]) => {
+    if (/authorization/i.test(k)) return [k, "****"]
+    return [k, v]
+  }))
+  let bodyLen = 0
+  try {
+    if (init.body && typeof init.body === "string") bodyLen = init.body.length
+  } catch { }
 
-async function getAssignedProjects(discordId: string, base: string): Promise<AssignedProject[]> {
-  const url = `${base}/api/discord/assigned-projects?discord_id=${encodeURIComponent(discordId)}`
-  const res = await fetch(url, { headers: { "Content-Type": "application/json" }, cache: "no-store" })
-  if (!res.ok) throw new Error(`Failed to load assigned projects (${res.status})`)
-  return (await res.json()) as AssignedProject[]
-}
+  console.log(`[interactions][${label}] → ${method} ${url} headers=${JSON.stringify(headers)} bodyLen=${bodyLen}`)
 
-async function postJson(url: string, body: unknown, headers: Record<string, string> = {}) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...headers },
-    body: JSON.stringify(body),
-  })
+  const res = await fetch(url, init)
+
+  const dur = Date.now() - startedAt
   if (!res.ok) {
-    let msg = `${res.status} ${res.statusText}`
-    try {
-      const j = await res.json()
-      msg = j?.error || j?.message || msg
-    } catch {
-      try { msg = await res.text() } catch {}
-    }
-    throw new Error(msg)
+    const text = await res.text().catch(() => "")
+    const snippet = text.slice(0, 500) // cap logs
+    console.error(
+      `[interactions][${label}] ← ${res.status} ${res.statusText} (${dur}ms)\n` +
+      `URL: ${url}\n` +
+      `Response: ${snippet || "<no body>"}`
+    )
+    const err = new Error(`Fetch failed (${label}) ${res.status} ${res.statusText}: ${snippet || "<no body>"}`)
+      ; (err as any).status = res.status
+      ; (err as any).url = url
+    throw err
   }
-  try { return await res.json() } catch { return null }
-}
 
-async function patchJson(url: string, body: unknown, headers: Record<string, string> = {}) {
-  const res = await fetch(url, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json", ...headers },
-    body: JSON.stringify(body),
-  })
-  if (!res.ok) {
-    let msg = `${res.status} ${res.statusText}`
-    try {
-      const j = await res.json()
-      msg = j?.error || j?.message || msg
-    } catch {
-      try { msg = await res.text() } catch {}
-    }
-    throw new Error(msg)
+  // Try to parse JSON, otherwise return text/null
+  const ct = res.headers.get("content-type") || ""
+  let data: any = null
+  if (ct.includes("application/json")) {
+    data = await res.json().catch(() => null)
+  } else {
+    data = await res.text().catch(() => null)
   }
-  try { return await res.json() } catch { return null }
+
+  console.log(`[interactions][${label}] ← ${res.status} OK (${dur}ms)`)
+  if (echoBody && data) {
+    console.log(`[interactions][${label}] body:`, typeof data === "string" ? data.slice(0, 500) : data)
+  }
+
+  return data
 }
 
-async function completeActiveMilestone(base: string, projectId: string | undefined, userId: string) {
-  if (!config.serviceBotToken) throw new Error("Server misconfigured: SERVICE_BOT_TOKEN")
-  return patchJson(
-    `${base}/api/projects/${projectId}/milestones`,
-    { status: "completed", callerDiscordId: userId },
-    { Authorization: `Bearer ${config.serviceBotToken}` },
-  )
-}
-
-async function postProgress(base: string, projectId: string | undefined, title: string, description: string, userId: string) {
-  if (!config.serviceBotToken) throw new Error("Server misconfigured: SERVICE_BOT_TOKEN")
-  return postJson(
-    `${base}/api/projects/${projectId}/progress`,
-    { title, description, callerDiscordId: userId },
-    { Authorization: `Bearer ${config.serviceBotToken}` },
-  )
-}
-
-/** Use application_id from the interaction body if present */
 async function sendFollowup(applicationId: string | undefined, token: string | undefined, content: string, ephemeral = false) {
   const appId = applicationId || config.discordAppId
-  if (!appId || !token) return
+  if (!appId || !token) {
+    console.warn("[interactions][followup] missing appId or token; skipping")
+    return
+  }
   const url = `https://discord.com/api/v10/webhooks/${appId}/${token}`
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content, flags: ephemeral ? EPHEMERAL : undefined }),
-  })
+  try {
+    await fetchWithTrace(
+      "followup",
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content, flags: ephemeral ? EPHEMERAL : undefined }),
+      },
+    )
+  } catch (err: any) {
+    console.error("[interactions][followup] failed:", err?.message || err)
+  }
 }
 
+type AssignedProject = { id: number; name: string }
 function optionValue(id: number, name: string) {
   return `${id}::${encodeURIComponent(name)}`
 }
@@ -198,6 +206,41 @@ function buildProgressModal(projectId: string, projectName: string) {
   }
 }
 
+async function getAssignedProjects(discordId: string, base: string): Promise<AssignedProject[]> {
+  const url = `${base}/api/discord/assigned-projects?discord_id=${encodeURIComponent(discordId)}`
+  const data = await fetchWithTrace("assigned-projects", url, {
+    headers: { "Content-Type": "application/json" },
+    cache: "no-store",
+  })
+  return Array.isArray(data) ? data as AssignedProject[] : []
+}
+
+async function completeActiveMilestone(base: string, projectId: string | undefined, userId: string) {
+  if (!config.serviceBotToken) throw new Error("Server misconfigured: SERVICE_BOT_TOKEN")
+  const url = `${base}/api/projects/${projectId}/milestones`
+  return fetchWithTrace("patch-milestone", url, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.serviceBotToken}`,
+    },
+    body: JSON.stringify({ status: "completed", callerDiscordId: userId }),
+  })
+}
+
+async function postProgress(base: string, projectId: string | undefined, title: string, description: string, userId: string) {
+  if (!config.serviceBotToken) throw new Error("Server misconfigured: SERVICE_BOT_TOKEN")
+  const url = `${base}/api/projects/${projectId}/progress`
+  return fetchWithTrace("post-progress", url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.serviceBotToken}`,
+    },
+    body: JSON.stringify({ title, description, callerDiscordId: userId }),
+  })
+}
+
 // ---- ROUTE ----
 export async function POST(req: NextRequest) {
   const raw = await req.text()
@@ -207,6 +250,14 @@ export async function POST(req: NextRequest) {
 
   const body = JSON.parse(raw)
   const base = getBaseUrl(req)
+
+  // Log a quick env snapshot (safe)
+  console.log("[interactions] base:", base, "env:", {
+    hasBackendUrl: !!config.backendUrl,
+    hasServiceBotToken: !!config.serviceBotToken,
+    hasAppId: !!config.discordAppId,
+    hasPublicKey: !!config.discordPublicKey,
+  })
 
   // 1) PING
   if (body?.type === InteractionType.PING) {
@@ -240,9 +291,11 @@ export async function POST(req: NextRequest) {
           },
         })
       } catch (err: any) {
+        console.error("[interactions][progress-update] error:", err?.message || err)
+        const msg = DEBUG_TO_DISCORD ? `❌ Error: ${err?.message || "failed to load projects"}` : "❌ Error loading projects"
         return NextResponse.json({
           type: InteractionCallbackType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: `❌ Error: ${err?.message || "failed to load projects"}`, flags: EPHEMERAL },
+          data: { content: msg, flags: EPHEMERAL },
         })
       }
     }
@@ -266,9 +319,11 @@ export async function POST(req: NextRequest) {
           },
         })
       } catch (err: any) {
+        console.error("[interactions][milestone-status] error:", err?.message || err)
+        const msg = DEBUG_TO_DISCORD ? `❌ Error: ${err?.message || "failed to load projects"}` : "❌ Error loading projects"
         return NextResponse.json({
           type: InteractionCallbackType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: `❌ Error: ${err?.message || "failed to load projects"}`, flags: EPHEMERAL },
+          data: { content: msg, flags: EPHEMERAL },
         })
       }
     }
@@ -340,25 +395,26 @@ export async function POST(req: NextRequest) {
         })
       }
 
-      // ACK immediately, then do the work and send follow-ups
-      queueMicrotask(async () => {
-        try {
-          await completeActiveMilestone(base, projectId, userId)
-          await sendFollowup(body?.application_id, body?.token,
-            `🎯 **${projectName}** — active milestone **marked completed** by <@${userId}>`,
-            false
-          )
-          await sendFollowup(body?.application_id, body?.token,
-            `Done. Active milestone marked **completed** for **${projectName}**.`,
-            true
-          )
-        } catch (err: any) {
-          await sendFollowup(body?.application_id, body?.token,
-            `❌ Error updating milestone: ${err?.message || "unknown error"}`,
-            true
-          )
-        }
-      })
+      // Do work NOW, then return a deferred update ack
+      try {
+        await completeActiveMilestone(base, projectId, userId)
+        await sendFollowup(
+          body?.application_id,
+          body?.token,
+          `🎯 **${projectName}** — active milestone **marked completed** by <@${userId}>`,
+          false
+        )
+        await sendFollowup(
+          body?.application_id,
+          body?.token,
+          `Done. Active milestone marked **completed** for **${projectName}**.`,
+          true
+        )
+      } catch (err: any) {
+        console.error("[interactions][set_status] error:", err?.message || err)
+        const msg = DEBUG_TO_DISCORD ? `❌ Error updating milestone: ${err?.message || "unknown error"}` : "❌ Failed to update milestone"
+        await sendFollowup(body?.application_id, body?.token, msg, true)
+      }
 
       return NextResponse.json({ type: InteractionCallbackType.DEFERRED_UPDATE_MESSAGE })
     }
@@ -387,29 +443,25 @@ export async function POST(req: NextRequest) {
       const title = fields["title_input"] || ""
       const description = fields["desc_input"] || ""
 
-      // ACK immediately, then do the work and follow-ups
-      queueMicrotask(async () => {
-        try {
-          await postProgress(base, projectId, title, description, userId)
-          await sendFollowup(body?.application_id, body?.token,
-            [
-              `📝 **${projectName}** — recent update from <@${userId}>`,
-              `**Title:** ${title}`,
-              description ? `**Description:** ${description}` : `**Description:** _none_`,
-            ].join("\n"),
-            false
-          )
-          await sendFollowup(body?.application_id, body?.token,
-            `✅ Posted a recent update to **${projectName}**.`,
-            true
-          )
-        } catch (err: any) {
-          await sendFollowup(body?.application_id, body?.token,
-            `❌ Error: ${err?.message || "failed to post update"}`,
-            true
-          )
-        }
-      })
+      try {
+        await postProgress(base, projectId, title, description, userId)
+
+        await sendFollowup(
+          body?.application_id,
+          body?.token,
+          [
+            `📝 **${projectName}** — recent update from <@${userId}>`,
+            `**Title:** ${title}`,
+            description ? `**Description:** ${description}` : `**Description:** _none_`,
+          ].join("\n"),
+          false
+        )
+        await sendFollowup(body?.application_id, body?.token, `✅ Posted a recent update to **${projectName}**.`, true)
+      } catch (err: any) {
+        console.error("[interactions][progress_modal] error:", err?.message || err)
+        const msg = DEBUG_TO_DISCORD ? `❌ Error: ${err?.message || "failed to post update"}` : "❌ Failed to post update"
+        await sendFollowup(body?.application_id, body?.token, msg, true)
+      }
 
       return NextResponse.json({ type: InteractionCallbackType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE })
     }
