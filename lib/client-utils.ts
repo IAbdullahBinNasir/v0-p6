@@ -1,15 +1,15 @@
 // This file contains utilities that are safe to use in client components
 import type { Milestone, Project } from "@/lib/types"
 
-export function formatCompactCurrency(amount: number): string {
-  if (amount >= 1_000_000) {
-    return `${(amount / 1_000_000).toFixed(1)}M CKB`
-  }
-  if (amount >= 1_000) {
-    return `${(amount / 1_000).toFixed(1)}K CKB`
-  }
-  return `${amount.toFixed(0)} CKB`
-}
+// export function formatCompactCurrency(amount: number): string {
+//   if (amount >= 1_000_000) {
+//     return `${(amount / 1_000_000).toFixed(1)}M CKB`
+//   }
+//   if (amount >= 1_000) {
+//     return `${(amount / 1_000).toFixed(1)}K CKB`
+//   }
+//   return `${amount.toFixed(0)} CKB`
+// }
 
 export function filterProjects(projects: Project[], searchTerm: string): Project[] {
   if (!searchTerm || searchTerm.trim() === "") {

@@ -7,8 +7,7 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { StatusBadge } from "@/components/ui/status-badge"
 import { ProjectProgress } from "@/components/ui/project-progress"
-import { formatCompactCurrency } from "@/lib/client-utils"
-import { capitalizeStatus } from "@/lib/utils"
+import { capitalizeStatus, formatCompactCurrency } from "@/lib/utils"
 import type { Milestone, Project } from "@/lib/types"
 
 /** Props: pass paginated Projects and the (global or page) Milestones list */
