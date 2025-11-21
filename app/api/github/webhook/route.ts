@@ -6,6 +6,8 @@ import crypto from "crypto"
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
+// --- helpers ---
+
 function normalizeRepo(repo?: string | null): string | null {
     if (!repo) return null
     const r = repo.trim()
@@ -56,11 +58,13 @@ async function insertActivityLog(entry: {
   `
 }
 
+// HMAC verification for x-hub-signature-256
 function verifyGithubSignature(rawBody: string, signatureHeader: string | null): boolean {
     const secret = process.env.GITHUB_WEBHOOK_SECRET
     if (!secret) {
         console.warn("[github webhook] no GITHUB_WEBHOOK_SECRET set, skipping verification")
-        return true // or false if you want to enforce it
+        // set to false if you want to enforce having the secret
+        return true
     }
 
     if (!signatureHeader || !signatureHeader.startsWith("sha256=")) {
@@ -72,43 +76,61 @@ function verifyGithubSignature(rawBody: string, signatureHeader: string | null):
     hmac.update(rawBody, "utf8")
     const expected = hmac.digest("hex")
 
-    // timing-safe compare
     const aBuf = Buffer.from(theirSig, "hex")
     const bBuf = Buffer.from(expected, "hex")
     if (aBuf.length !== bBuf.length) return false
 
-    // Convert Node Buffer to Uint8Array (ArrayBufferView) using the underlying ArrayBuffer,
-    // preserving byteOffset/byteLength to avoid copying and to satisfy TypeScript types.
+    // timing-safe compare, using Uint8Array views for TS correctness
     const a = new Uint8Array(aBuf.buffer, aBuf.byteOffset, aBuf.byteLength)
     const b = new Uint8Array(bBuf.buffer, bBuf.byteOffset, bBuf.byteLength)
     return crypto.timingSafeEqual(a, b)
 }
 
+// --- route handler ---
+
 export async function POST(req: NextRequest) {
     try {
-        // 1) read raw body
+        // 1) read raw body as text (needed for HMAC)
         const rawBody = await req.text()
 
         // 2) verify signature
         const sigHeader = req.headers.get("x-hub-signature-256")
-        const ok = verifyGithubSignature(rawBody, sigHeader)
-        if (!ok) {
+        const signatureOk = verifyGithubSignature(rawBody, sigHeader)
+        if (!signatureOk) {
             console.warn("[github webhook] invalid signature")
             return NextResponse.json({ ok: false, error: "invalid_signature" }, { status: 401 })
         }
 
-        // 3) parse JSON
+        // 3) parse JSON & get event type
         const body = JSON.parse(rawBody)
-        const event = req.headers.get("x-github-event")
+        const event = req.headers.get("x-github-event") || "unknown"
 
+        // --- handle basic org-level / setup events first ---
+
+        if (event === "ping") {
+            // GitHub sends this when you first configure the webhook
+            return NextResponse.json({ ok: true, handled: "ping" })
+        }
+
+        if (event === "installation" || event === "installation_repositories") {
+            // these don't have repository.full_name (they're org-level)
+            return NextResponse.json({ ok: true, skipped: `org_level_event:${event}` })
+        }
+
+        // For events we care about (push, pull_request) we expect repository.full_name
         const repoFullName: string | undefined = body?.repository?.full_name
         if (!repoFullName) {
-            return NextResponse.json({ ok: false, reason: "no_repository" }, { status: 400 })
+            // don't 400 here – just acknowledge and skip
+            return NextResponse.json(
+                { ok: true, skipped: "no_repository_in_payload", event },
+                { status: 200 },
+            )
         }
 
         const projectId = await findProjectIdByRepo(repoFullName)
         if (!projectId) {
-            return NextResponse.json({ ok: true, skipped: "no_matching_project" })
+            // repo is not linked to any project in your DB, so we just ignore it
+            return NextResponse.json({ ok: true, skipped: "no_matching_project", repo: repoFullName })
         }
 
         // --- handle push events (commits) ---
@@ -131,11 +153,12 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ ok: true, handled: "push", commits: commits.length })
         }
 
-        // --- handle pull_request events (merge) ---
+        // --- handle pull_request events (for merges) ---
         if (event === "pull_request") {
             const action = body.action
             const pr = body.pull_request
 
+            // only log when PR is merged
             if (action === "closed" && pr?.merged) {
                 await insertActivityLog({
                     projectId,
@@ -151,9 +174,11 @@ export async function POST(req: NextRequest) {
                 return NextResponse.json({ ok: true, handled: "pull_request_merged", pr: pr.number })
             }
 
+            // ignore non-merged PR events
             return NextResponse.json({ ok: true, skipped: "pull_request_not_merged" })
         }
 
+        // --- everything else we don't care about ---
         return NextResponse.json({ ok: true, skipped: `unhandled_event:${event}` })
     } catch (e: any) {
         console.error("[github webhook] error:", e)
