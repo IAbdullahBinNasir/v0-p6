@@ -78,7 +78,7 @@ async function checkGithubActivity(repo: string, sinceIso: string): Promise<Gith
   try {
     const sinceDate = new Date(sinceIso)
 
-    // --- latest commit (not filtered by since: we want the most recent one, even if old) ---
+    // --- latest commit (we want the latest, then check if it's within last 30d) ---
     const commitsUrl = `${base}/commits?per_page=1`
     const cRes = await fetch(commitsUrl, { headers, cache: "no-store" })
     if (!cRes.ok) {
@@ -114,7 +114,7 @@ async function checkGithubActivity(repo: string, sinceIso: string): Promise<Gith
       }
     }
 
-    // --- latest merged PR (again, we want latest, then check if it's within the last 30d) ---
+    // --- latest merged PR (pick most recently merged; check if within 30d) ---
     const prsUrl = `${base}/pulls?state=all&sort=updated&direction=desc&per_page=20`
     const pRes = await fetch(prsUrl, { headers, cache: "no-store" })
     if (!pRes.ok) {
@@ -131,7 +131,6 @@ async function checkGithubActivity(repo: string, sinceIso: string): Promise<Gith
     let pullActivity = false
 
     if (Array.isArray(pulls) && pulls.length > 0) {
-      // pick the most recently merged PR (if any)
       const mergedPr = pulls.find((pr) => !!pr?.merged_at) ?? null
       if (mergedPr) {
         const mergedAt: string | null = mergedPr.merged_at ?? null
@@ -243,13 +242,12 @@ async function runRiskScanJob() {
     const normRepo = normalizeRepo(p.github_repo)
     let repo_check: "none" | "checked" | "invalid" | "error" = "none"
     let gh: { commitActivity?: boolean; pullActivity?: boolean; reason?: string } = {}
-    let ghRes: GithubCheck | null = null
 
     if (normRepo === null && p.github_repo) {
       repo_check = "invalid"
       gh = { reason: "invalid_repo_format" }
     } else if (normRepo) {
-      ghRes = await checkGithubActivity(normRepo, sinceIso)
+      const ghRes = await checkGithubActivity(normRepo, sinceIso)
       if (!ghRes.ok) {
         repo_check = ghRes.reason?.startsWith("invalid_repo_format") ? "invalid" : "error"
         gh = { reason: ghRes.reason }
@@ -260,14 +258,15 @@ async function runRiskScanJob() {
           pullActivity: !!ghRes.pullActivity,
         }
 
-        // ---- NEW: log latest commit / merged PR into activity_logs ----
+        // ---- GitHub → Recent Updates (activity_logs) ----
+        // Latest commit → activity_type = "commit", source = "github"
         if (ghRes.lastCommit && ghRes.lastCommit.url) {
           const already = await activityExists(p.id, "commit", ghRes.lastCommit.url)
           if (!already) {
             await insertActivityLog({
               projectId: p.id,
               activity_type: "commit",
-              source: "github",
+              source: "github", // this becomes the "GITHUB" tag in your UI
               title: ghRes.lastCommit.message?.split("\n")[0] || "Commit",
               description: ghRes.lastCommit.message,
               url: ghRes.lastCommit.url,
@@ -277,24 +276,25 @@ async function runRiskScanJob() {
           }
         }
 
+        // Latest merged PR → activity_type = "merge", source = "github"
         if (ghRes.lastMergedPr && ghRes.lastMergedPr.url) {
           const already = await activityExists(p.id, "merge", ghRes.lastMergedPr.url)
           if (!already) {
             await insertActivityLog({
               projectId: p.id,
-              activity_type: "merge", // or "pull_request_merged"
-              source: "github",
+              activity_type: "merge",
+              source: "github", // will show as GITHUB tag
               title: ghRes.lastMergedPr.title || `Merged PR #${ghRes.lastMergedPr.number}`,
               description: ghRes.lastMergedPr.merged
                 ? `PR #${ghRes.lastMergedPr.number} merged`
                 : `PR #${ghRes.lastMergedPr.number} (${ghRes.lastMergedPr.state})`,
               url: ghRes.lastMergedPr.url,
-              author: null, // if you want, fetch author via pr.user.login from a richer payload
+              author: null,
               timestamp: ghRes.lastMergedPr.mergedAt || ghRes.lastMergedPr.updatedAt,
             })
           }
         }
-        // ---- end NEW logging ----
+        // ---- end GitHub → Recent Updates ----
       }
     } else {
       repo_check = "none"
@@ -352,10 +352,10 @@ async function runRiskScanJob() {
   return { since: sinceIso, results }
 }
 
-// --- POST: manual/script trigger with SERVICE_BOT_TOKEN ---
+// --- POST: manual / scheduler trigger with SERVICE_BOT_TOKEN ---
 export async function POST(req: Request) {
   try {
-    const auth = (req as any).headers?.get?.("authorization") || ""
+    const auth = req.headers.get("authorization") || ""
     const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : ""
     if (!config.serviceBotToken || token !== config.serviceBotToken) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 })

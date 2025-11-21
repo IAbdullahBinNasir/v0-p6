@@ -13,7 +13,7 @@ const requiredVars = [
 validateEnvironmentVariables(requiredVars)
 
 export const config = {
-  backendUrl: process.env.NEXT_PUBLIC_BACKEND_URL!,
+  backendUrl: process.env.BACKEND_URL!,
   serviceBotToken: process.env.SERVICE_BOT_TOKEN!,
   githubToken: process.env.GITHUB_TOKEN!,
   discordBotToken: process.env.DISCORD_BOT_TOKEN_COMMANDER!,
