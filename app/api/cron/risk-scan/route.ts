@@ -6,13 +6,15 @@ import { config } from "@/configs/config"
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
-// --- your helpers (unchanged) ---
+// --- helpers ---
 const DAYS_30_MS = 30 * 24 * 60 * 60 * 1000
+
 function isAtLeast30DaysOld(createdAt: string | Date) {
   const created = new Date(createdAt)
   const age = Date.now() - created.getTime()
   return age >= DAYS_30_MS
 }
+
 function normalizeRepo(repo?: string | null): string | null {
   if (!repo) return null
   const r = repo.trim()
@@ -21,6 +23,7 @@ function normalizeRepo(repo?: string | null): string | null {
   if (/^[^/\s]+\/[^/\s]+$/.test(r)) return r
   return null
 }
+
 async function getDiscordActivityCount(projectId: number, sinceIso: string) {
   const rows = await sql/*sql*/`
     SELECT COUNT(*)::int AS cnt
@@ -31,50 +34,182 @@ async function getDiscordActivityCount(projectId: number, sinceIso: string) {
   `
   return (rows?.[0]?.cnt ?? 0) as number
 }
+
+// ---------- GitHub helpers ----------
+
+type GithubCommitSummary = {
+  sha: string
+  message: string | null
+  authorName: string | null
+  date: string | null
+  url: string | null
+}
+
+type GithubPrSummary = {
+  number: number
+  title: string | null
+  state: string
+  merged: boolean
+  updatedAt: string | null
+  mergedAt: string | null
+  url: string | null
+}
+
 type GithubCheck = {
   ok: boolean
   reason?: string
   commitActivity?: boolean
   pullActivity?: boolean
+  lastCommit?: GithubCommitSummary | null
+  lastMergedPr?: GithubPrSummary | null
 }
+
 async function checkGithubActivity(repo: string, sinceIso: string): Promise<GithubCheck> {
   if (!repo || !repo.includes("/")) return { ok: false, reason: "invalid_repo_format" }
+
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "User-Agent": "risk-scan",
   }
   if (config.githubToken) headers.Authorization = `Bearer ${config.githubToken}`
+
   const base = `https://api.github.com/repos/${repo}`
+
   try {
-    const commitsUrl = `${base}/commits?since=${encodeURIComponent(sinceIso)}&per_page=1`
+    const sinceDate = new Date(sinceIso)
+
+    // --- latest commit (not filtered by since: we want the most recent one, even if old) ---
+    const commitsUrl = `${base}/commits?per_page=1`
     const cRes = await fetch(commitsUrl, { headers, cache: "no-store" })
     if (!cRes.ok) {
       const t = await cRes.text().catch(() => "")
       return { ok: false, reason: `commits_check_failed:${cRes.status}:${t}` }
     }
     const commits = (await cRes.json()) as any[]
-    const commitActivity = Array.isArray(commits) && commits.length > 0
+    let lastCommit: GithubCommitSummary | null = null
+    let commitActivity = false
 
-    const prsUrl = `${base}/pulls?state=all&sort=updated&direction=desc&per_page=5`
+    if (Array.isArray(commits) && commits.length > 0) {
+      const c = commits[0]
+      const cMsg = c?.commit?.message ?? null
+      const cDate: string | null =
+        c?.commit?.author?.date ?? c?.commit?.committer?.date ?? null
+      const cAuthor: string | null =
+        c?.commit?.author?.name ??
+        c?.author?.login ??
+        c?.commit?.committer?.name ??
+        null
+
+      lastCommit = {
+        sha: c?.sha ?? "",
+        message: cMsg,
+        authorName: cAuthor,
+        date: cDate,
+        url: c?.html_url ?? null,
+      }
+
+      if (cDate) {
+        const d = new Date(cDate)
+        commitActivity = d >= sinceDate
+      }
+    }
+
+    // --- latest merged PR (again, we want latest, then check if it's within the last 30d) ---
+    const prsUrl = `${base}/pulls?state=all&sort=updated&direction=desc&per_page=20`
     const pRes = await fetch(prsUrl, { headers, cache: "no-store" })
     if (!pRes.ok) {
       const t = await pRes.text().catch(() => "")
-      return { ok: false, reason: `prs_check_failed:${pRes.status}:${t}`, commitActivity }
+      return {
+        ok: false,
+        reason: `prs_check_failed:${pRes.status}:${t}`,
+        commitActivity,
+        lastCommit,
+      }
     }
     const pulls = (await pRes.json()) as any[]
-    const sinceTs = new Date(sinceIso).getTime()
-    const pullActivity = (Array.isArray(pulls) ? pulls : []).some((pr) => {
-      const updatedAt = pr?.updated_at ? new Date(pr.updated_at).getTime() : 0
-      const mergedAt = pr?.merged_at ? new Date(pr.merged_at).getTime() : 0
-      return updatedAt >= sinceTs || mergedAt >= sinceTs
-    })
-    return { ok: true, commitActivity, pullActivity }
+    let lastMergedPr: GithubPrSummary | null = null
+    let pullActivity = false
+
+    if (Array.isArray(pulls) && pulls.length > 0) {
+      // pick the most recently merged PR (if any)
+      const mergedPr = pulls.find((pr) => !!pr?.merged_at) ?? null
+      if (mergedPr) {
+        const mergedAt: string | null = mergedPr.merged_at ?? null
+        const updatedAt: string | null = mergedPr.updated_at ?? null
+
+        lastMergedPr = {
+          number: mergedPr.number,
+          title: mergedPr.title ?? null,
+          state: mergedPr.state ?? "closed",
+          merged: !!mergedPr.merged_at,
+          updatedAt,
+          mergedAt,
+          url: mergedPr.html_url ?? null,
+        }
+
+        const compareDateStr = mergedAt ?? updatedAt
+        if (compareDateStr) {
+          const d = new Date(compareDateStr)
+          pullActivity = d >= sinceDate
+        }
+      }
+    }
+
+    return {
+      ok: true,
+      commitActivity,
+      pullActivity,
+      lastCommit,
+      lastMergedPr,
+    }
   } catch (e: any) {
     return { ok: false, reason: `github_error:${e?.message || "unknown"}` }
   }
 }
 
-// --- core job (your existing POST logic moved into a function) ---
+// ---------- activity_logs helpers ----------
+
+async function activityExists(projectId: number, activity_type: string, url: string | null): Promise<boolean> {
+  if (!url) return false
+  const rows = await sql/*sql*/`
+    SELECT 1
+    FROM activity_logs
+    WHERE project_id = ${projectId}
+      AND activity_type = ${activity_type}
+      AND url = ${url}
+    LIMIT 1
+  `
+  return rows.length > 0
+}
+
+async function insertActivityLog(entry: {
+  projectId: number
+  activity_type: string
+  source: string
+  title: string | null
+  description: string | null
+  url: string | null
+  author: string | null
+  timestamp: string | null
+}) {
+  const { projectId, activity_type, source, title, description, url, author, timestamp } = entry
+
+  await sql/*sql*/`
+    INSERT INTO activity_logs (project_id, activity_type, source, title, description, url, author, "timestamp")
+    VALUES (
+      ${projectId},
+      ${activity_type},
+      ${source},
+      ${title},
+      ${description},
+      ${url},
+      ${author},
+      ${timestamp ? new Date(timestamp) : new Date()}
+    )
+  `
+}
+
+// --- core job ---
 async function runRiskScanJob() {
   const since = new Date(Date.now() - DAYS_30_MS)
   const sinceIso = since.toISOString()
@@ -98,7 +233,7 @@ async function runRiskScanJob() {
     note: string
   }> = []
 
-  for (const p of projects) {
+  for (const p of projects as any[]) {
     const createdAt = new Date(p.created_at)
     const ageDays = Math.floor((Date.now() - createdAt.getTime()) / (24 * 60 * 60 * 1000))
 
@@ -108,23 +243,64 @@ async function runRiskScanJob() {
     const normRepo = normalizeRepo(p.github_repo)
     let repo_check: "none" | "checked" | "invalid" | "error" = "none"
     let gh: { commitActivity?: boolean; pullActivity?: boolean; reason?: string } = {}
+    let ghRes: GithubCheck | null = null
 
     if (normRepo === null && p.github_repo) {
       repo_check = "invalid"
       gh = { reason: "invalid_repo_format" }
     } else if (normRepo) {
-      const ghRes = await checkGithubActivity(normRepo, sinceIso)
+      ghRes = await checkGithubActivity(normRepo, sinceIso)
       if (!ghRes.ok) {
         repo_check = ghRes.reason?.startsWith("invalid_repo_format") ? "invalid" : "error"
         gh = { reason: ghRes.reason }
       } else {
         repo_check = "checked"
-        gh = { commitActivity: !!ghRes.commitActivity, pullActivity: !!ghRes.pullActivity }
+        gh = {
+          commitActivity: !!ghRes.commitActivity,
+          pullActivity: !!ghRes.pullActivity,
+        }
+
+        // ---- NEW: log latest commit / merged PR into activity_logs ----
+        if (ghRes.lastCommit && ghRes.lastCommit.url) {
+          const already = await activityExists(p.id, "commit", ghRes.lastCommit.url)
+          if (!already) {
+            await insertActivityLog({
+              projectId: p.id,
+              activity_type: "commit",
+              source: "github",
+              title: ghRes.lastCommit.message?.split("\n")[0] || "Commit",
+              description: ghRes.lastCommit.message,
+              url: ghRes.lastCommit.url,
+              author: ghRes.lastCommit.authorName,
+              timestamp: ghRes.lastCommit.date,
+            })
+          }
+        }
+
+        if (ghRes.lastMergedPr && ghRes.lastMergedPr.url) {
+          const already = await activityExists(p.id, "merge", ghRes.lastMergedPr.url)
+          if (!already) {
+            await insertActivityLog({
+              projectId: p.id,
+              activity_type: "merge", // or "pull_request_merged"
+              source: "github",
+              title: ghRes.lastMergedPr.title || `Merged PR #${ghRes.lastMergedPr.number}`,
+              description: ghRes.lastMergedPr.merged
+                ? `PR #${ghRes.lastMergedPr.number} merged`
+                : `PR #${ghRes.lastMergedPr.number} (${ghRes.lastMergedPr.state})`,
+              url: ghRes.lastMergedPr.url,
+              author: null, // if you want, fetch author via pr.user.login from a richer payload
+              timestamp: ghRes.lastMergedPr.mergedAt || ghRes.lastMergedPr.updatedAt,
+            })
+          }
+        }
+        // ---- end NEW logging ----
       }
     } else {
       repo_check = "none"
     }
 
+    // too new → still appear in results but not marked at_risk
     if (!isAtLeast30DaysOld(createdAt)) {
       results.push({
         projectId: p.id,
@@ -176,10 +352,10 @@ async function runRiskScanJob() {
   return { since: sinceIso, results }
 }
 
-// --- POST: for manual/scripted trigger with SERVICE_BOT_TOKEN ---
+// --- POST: manual/script trigger with SERVICE_BOT_TOKEN ---
 export async function POST(req: Request) {
   try {
-    const auth = req.headers.get("authorization") || ""
+    const auth = (req as any).headers?.get?.("authorization") || ""
     const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : ""
     if (!config.serviceBotToken || token !== config.serviceBotToken) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
@@ -198,7 +374,6 @@ export async function POST(req: Request) {
 // --- GET: for Vercel Scheduled Functions (no headers supported) ---
 export async function GET(req: NextRequest) {
   try {
-    // Optional extra safety: only allow from Vercel cron in prod
     const isCron = req.headers.get("x-vercel-cron") === "1"
     if (process.env.VERCEL && !isCron) {
       return NextResponse.json({ error: "Forbidden" }, { status: 403 })
