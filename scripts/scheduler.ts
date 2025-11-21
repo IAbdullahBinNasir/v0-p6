@@ -25,6 +25,6 @@ async function runRiskScan() {
 // run once on start (optional)
 runRiskScan();
 
-// run every minute
-cron.schedule("* * * * *", runRiskScan, { timezone: "UTC" });
-console.log("[scheduler] Cron set: * * * * * (every minute). Press Ctrl+C to stop.");
+// run every 5 minute
+cron.schedule("*/5 * * * *", runRiskScan, { timezone: "UTC" });
+console.log("[scheduler] Cron set: */5 * * * * (every 5 minutes). Press Ctrl+C to stop.");
