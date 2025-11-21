@@ -266,7 +266,7 @@ async function runRiskScanJob() {
             await insertActivityLog({
               projectId: p.id,
               activity_type: "commit",
-              source: "github", // this becomes the "GITHUB" tag in your UI
+              source: "GITHUB", // this becomes the "GITHUB" tag in your UI
               title: ghRes.lastCommit.message?.split("\n")[0] || "Commit",
               description: ghRes.lastCommit.message,
               url: ghRes.lastCommit.url,
@@ -283,7 +283,7 @@ async function runRiskScanJob() {
             await insertActivityLog({
               projectId: p.id,
               activity_type: "merge",
-              source: "github", // will show as GITHUB tag
+              source: "GITHUB", // will show as GITHUB tag
               title: ghRes.lastMergedPr.title || `Merged PR #${ghRes.lastMergedPr.number}`,
               description: ghRes.lastMergedPr.merged
                 ? `PR #${ghRes.lastMergedPr.number} merged`
